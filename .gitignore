@@ -1,0 +1,12 @@
+# Entorno virtual (se recrea con: pip install -r requirements.txt)
+.venv/
+
+# Archivos generados por Python
+__pycache__/
+*.pyc
+
+# Muestra de datos que genera explorar_api.py
+muestra_eventos.json
+
+# macOS
+.DS_Store
