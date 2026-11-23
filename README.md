@@ -2,7 +2,7 @@
 
 Servidor MCP que conecta un agente de IA con los **datos abiertos del Ayuntamiento de Zaragoza**, para que puedas preguntarle en lenguaje natural *"¿qué plan hay hoy?"* y te responda con eventos reales.
 
-> 🎬 _Aquí irá el GIF de la demo_
+![Demo: Claude busca planes gratis para el finde, eventos cerca de la Aljafería y Bizis disponibles por allí](docs/demo.gif)
 
 ## Herramientas
 
