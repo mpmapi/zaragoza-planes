@@ -11,6 +11,7 @@ import json
 import math
 import re
 import ssl
+import sys
 import time
 import unicodedata
 import urllib.error
@@ -18,11 +19,13 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.elicitation import CancelledElicitation, DeclinedElicitation, ElicitationResult
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import Field
+from mcp.server.mcpserver.resolve import Elicit, Resolve
+from pydantic import BaseModel, Field, create_model
 
 API_EVENTOS = "https://www.zaragoza.es/sede/servicio/actividades/evento/list.json"
 URL_FICHA_EVENTO = "https://www.zaragoza.es/sede/servicio/cultura/evento/{id}"
@@ -459,8 +462,9 @@ def _sitios(eventos: list[dict]) -> list[dict]:
     return sitios
 
 
-def _buscar_sitio(buscadas: set[str], sitios: list[dict]) -> list[dict]:
-    """Sitios que contienen todas las palabras buscadas, del más al menos probable."""
+def _buscar_sitio(buscadas: set[str], sitios: list[dict]) -> list[tuple[tuple, dict]]:
+    """(puntuación, sitio) de los que contienen todas las palabras buscadas,
+    del más al menos probable (menor puntuación = mejor)."""
     puntuados = []
     for s in sitios:
         en_nombre = _palabras(s["nombre"])
@@ -475,41 +479,220 @@ def _buscar_sitio(buscadas: set[str], sitios: list[dict]) -> list[dict]:
         # "Centro Cívico Valdefierro Pilar Adiego").
         puntuados.append(((en_direccion, s["tipo"] != "barrio", len(en_nombre - buscadas)), s))
     puntuados.sort(key=lambda p: p[0])
-    return [s for _, s in puntuados]
+    return puntuados
+
+
+def _coordenadas(lugar: str) -> dict | None:
+    m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", lugar or "")
+    if not m:
+        return None
+    lat, lon = float(m[1]), float(m[2])
+    return {"nombre": f"{lat:.5f}, {lon:.5f}", "tipo": "coordenadas", "lat": lat, "lon": lon}
+
+
+def _coincidencias(lugar: str, eventos: list[dict]) -> list[tuple[tuple, dict]]:
+    """Sitios que encajan con el texto: primero entre los lugares de los eventos
+    de esas fechas (ya descargados) y, si no aparece, en toda la agenda."""
+    buscadas = _palabras(lugar)
+    for cargar in (lambda: eventos, _eventos_toda_la_agenda):
+        try:
+            encontrados = _buscar_sitio(buscadas, _sitios(cargar()))
+        except ToolError:
+            continue   # si la agenda completa no carga, mejor "no encuentro" que "API caída"
+        if encontrados:
+            return encontrados
+    return []
+
+
+def _con_otras(coincidencias: list[tuple[tuple, dict]]) -> dict:
+    """La mejor coincidencia, con hasta 3 alternativas para que el agente las mencione."""
+    elegido = dict(coincidencias[0][1])
+    elegido["otras"] = list(dict.fromkeys(
+        f"{s['nombre']} ({s['tipo']})" for _, s in coincidencias[1:]
+        if s["nombre"] != elegido["nombre"]
+    ))[:3]
+    return elegido
 
 
 def _resolver_lugar(lugar: str, eventos: list[dict]) -> dict:
-    """Convierte el texto de la persona en un punto de referencia."""
-    m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", lugar or "")
-    if m:
-        lat, lon = float(m[1]), float(m[2])
-        return {"nombre": f"{lat:.5f}, {lon:.5f}", "tipo": "coordenadas", "lat": lat, "lon": lon}
-
-    buscadas = _palabras(lugar)
-    if not buscadas:
+    """Convierte el texto de la persona en un punto de referencia (sin preguntar)."""
+    ref = _coordenadas(lugar)
+    if ref:
+        return ref
+    if not _palabras(lugar):
         raise ToolError("Indica un sitio: un barrio, un lugar conocido o coordenadas 'lat,lon'.")
-
-    # Primero con los lugares de los eventos de esas fechas (ya descargados);
-    # si no aparece, con toda la agenda.
-    for cargar in (lambda: eventos, _eventos_toda_la_agenda):
-        try:
-            coincidencias = _buscar_sitio(buscadas, _sitios(cargar()))
-        except ToolError:
-            continue   # si la agenda completa no carga, mejor "no encuentro" que "API caída"
-        if coincidencias:
-            elegido = dict(coincidencias[0])
-            elegido["otras"] = list(dict.fromkeys(
-                f"{s['nombre']} ({s['tipo']})" for s in coincidencias[1:]
-                if s["nombre"] != elegido["nombre"]
-            ))[:3]
-            return elegido
-
+    coincidencias = _coincidencias(lugar, eventos)
+    if coincidencias:
+        return _con_otras(coincidencias)
     raise ToolError(
         f"No encuentro '{lugar}' entre los barrios, lugares de la agenda y "
         "estaciones Bizi. Prueba con un barrio (Delicias, Actur, Casco Histórico...), "
         "un lugar conocido (Plaza España, Aljafería, Teatro Principal...) o "
         "coordenadas 'lat,lon'."
     )
+
+
+# ---------------------------------------------------------------------------
+# Preguntar a la persona desde dónde parte (elicitation).
+# Si la ubicación está vacía ("cerca de mí"), no se conoce o es ambigua, la
+# herramienta pregunta con un formulario. Si el cliente no sabe mostrar
+# formularios, no falla: devuelve la pregunta para que la haga el agente.
+# ---------------------------------------------------------------------------
+
+# Palabras que no dicen ningún sitio: "cerca de mí", "por aquí", "donde estoy"...
+_SIN_SITIO = {
+    "cerca", "mi", "mis", "me", "yo", "aqui", "aca", "ahi", "alli", "estoy",
+    "encuentro", "ubicacion", "posicion", "alrededor", "alrededores", "zona",
+    "barrio", "casa", "donde", "por", "actual", "sitio", "lugar", "este", "esta",
+}
+
+OTRO_LUGAR = "otro"
+TITULO_OTRO_LUGAR = "Otro lugar (escríbelo abajo)"
+
+# Puntos de referencia que se ofrecen cuando no hay pistas. Llevan coordenadas
+# fijas porque el buscador no siempre acierta con ellos (p. ej. "Plaza del Pilar");
+# Actur se busca por nombre para que funcione como barrio.
+_REFERENCIAS = [
+    ("Plaza de España (centro)", {"nombre": "Plaza de España", "tipo": "punto de referencia",
+                                  "lat": 41.65190, "lon": -0.88040}),
+    ("Plaza del Pilar (Casco Histórico)", {"nombre": "Plaza del Pilar", "tipo": "punto de referencia",
+                                           "lat": 41.65650, "lon": -0.87860}),
+    ("Palacio de la Aljafería", {"nombre": "Palacio de la Aljafería", "tipo": "punto de referencia",
+                                 "lat": 41.65670, "lon": -0.89650}),
+    ("Estación Delicias", {"nombre": "Estación Delicias", "tipo": "punto de referencia",
+                           "lat": 41.65890, "lon": -0.91130}),
+    ("Actur", "Actur"),
+    ("Plaza San Francisco (Universidad)", {"nombre": "Plaza San Francisco", "tipo": "punto de referencia",
+                                           "lat": 41.64160, "lon": -0.89610}),
+]
+
+
+def _analizar_lugar(lugar: str, eventos: list[dict]) -> dict:
+    """Decide si el texto basta para ubicar a la persona o hay que preguntarle.
+
+    Devuelve {"ref": sitio} o {"pregunta": texto, "opciones": [(título, sitio | consulta)]}.
+    """
+    ref = _coordenadas(lugar)
+    if ref:
+        return {"ref": ref}
+    buscadas = _palabras(lugar)
+    if not buscadas or buscadas <= _SIN_SITIO:
+        return {"pregunta": "¿Desde qué zona de Zaragoza partes? Elige un punto de referencia "
+                            "o escribe otro lugar: un barrio, una plaza, un centro cívico…",
+                "opciones": _REFERENCIAS}
+
+    coincidencias = _coincidencias(lugar, eventos)
+    if not coincidencias:
+        return {"pregunta": f"No encuentro «{lugar.strip()}» en Zaragoza. ¿Desde qué zona partes? "
+                            "Elige un punto de referencia o escribe otro lugar.",
+                "opciones": _REFERENCIAS}
+
+    # Ambiguo: las dos mejores empatan y están a más de 1 km entre sí.
+    (clave1, s1), *resto = coincidencias
+    empatadas = [s for clave, s in resto if clave == clave1
+                 and _distancia_m((s1["lat"], s1["lon"]), (s["lat"], s["lon"])) > 1000]
+    if not empatadas:
+        return {"ref": _con_otras(coincidencias)}
+    opciones, vistos = [], set()
+    for _, s in coincidencias:
+        titulo = f"{s['nombre']} ({s['tipo']})"
+        if titulo not in vistos:
+            vistos.add(titulo)
+            opciones.append((titulo, s))
+    return {"pregunta": f"«{lugar.strip()}» puede referirse a varios sitios de Zaragoza. "
+                        "¿A cuál te refieres?",
+            "opciones": opciones[:4]}
+
+
+def _formulario(opciones: list) -> type[BaseModel]:
+    """Formulario con un desplegable de opciones y un texto libre para "otro lugar".
+
+    Las opciones se numeran ("1", "2"...) porque dos sitios pueden llamarse igual.
+    """
+    lista = [{"const": str(i), "title": titulo} for i, (titulo, _) in enumerate(opciones, 1)]
+    lista.append({"const": OTRO_LUGAR, "title": TITULO_OTRO_LUGAR})
+    return create_model(
+        "UbicacionDePartida",
+        zona=(str, Field(title="Zona o lugar", json_schema_extra={"oneOf": lista})),
+        otro_lugar=(str, Field(
+            default="", title="Otro lugar",
+            description="Solo si has elegido «Otro lugar». Por ejemplo: Delicias, "
+                        "Teatro Principal, Puerto Venecia.",
+        )),
+    )
+
+
+def _puede_preguntar(ctx: Context) -> bool:
+    """True si el cliente sabe mostrar formularios de elicitation."""
+    caps = ctx.client_capabilities
+    eli = caps.elicitation if caps is not None else None
+    if eli is None or (eli.form is None and eli.url is not None):
+        puede = False   # sin elicitation, o solo en modo URL
+    else:
+        # Hasta la versión 2025-11-25 la pregunta viaja como petición del servidor
+        # al cliente, y hace falta un canal de vuelta; desde 2026-07-28 va en la respuesta.
+        puede = ctx.session.can_send_request or (ctx.protocol_version or "") >= "2026-07-28"
+    # Va a stderr (en Claude Desktop, al log del servidor): sirve para saber si
+    # el cliente soporta elicitation sin adivinarlo.
+    print(f"[zaragoza-planes] protocolo={ctx.protocol_version} elicitation={eli!r} "
+          f"-> {'formulario' if puede else 'pregunta el agente'}", file=sys.stderr)
+    return puede
+
+
+def _preguntar_si_hace_falta(lugar: str, eventos: list[dict], ctx: Context,
+                             herramienta: str, parametro: str):
+    """Resolver: el sitio si está claro; si no, la pregunta (formulario o, si el
+    cliente no admite formularios, un mensaje para que pregunte el agente)."""
+    analisis = _analizar_lugar(lugar, eventos)
+    if "ref" in analisis:
+        return {"ref": analisis["ref"]}
+    if _puede_preguntar(ctx):
+        return Elicit(analisis["pregunta"], _formulario(analisis["opciones"]))
+    return {"sin_elicitation": {
+        "necesita_ubicacion": True,
+        "pregunta_para_la_persona": analisis["pregunta"],
+        "opciones_sugeridas": [t for t, _ in analisis["opciones"]] + ["Otro lugar"],
+        "instrucciones": (
+            "Este cliente no permite preguntar desde la herramienta. Haz tú esta "
+            "pregunta a la persona, ofreciéndole las opciones sugeridas, y vuelve a "
+            f"llamar a {herramienta} con su respuesta en «{parametro}». "
+            "No supongas una ubicación."
+        ),
+    }}
+
+
+def _ubicacion_elegida(resultado, lugar: str, eventos: list[dict], herramienta: str,
+                       parametro: str, si_rechaza: str) -> dict:
+    """Convierte lo que devolvió el resolver (o la respuesta de la persona) en
+    {"ref": sitio} o en {"respuesta": ...} que la herramienta devuelve tal cual."""
+    if isinstance(resultado, (DeclinedElicitation, CancelledElicitation)):
+        return {"respuesta": {"necesita_ubicacion": True, "nota": si_rechaza}}
+    datos = resultado.data
+    if isinstance(datos, dict):   # no hizo falta preguntar, o el cliente no puede
+        return {"ref": datos["ref"]} if "ref" in datos else {"respuesta": datos["sin_elicitation"]}
+
+    # La persona ha contestado el formulario.
+    if datos.zona == OTRO_LUGAR:
+        texto = (datos.otro_lugar or "").strip()
+        try:
+            # Ya se ha preguntado una vez: si es ambiguo, se toma la mejor
+            # coincidencia y la respuesta lista las otras.
+            return {"ref": _resolver_lugar(texto, eventos)}
+        except ToolError:
+            pass
+        return {"respuesta": {
+            "necesita_ubicacion": True,
+            "nota": (f"La persona ha escrito «{texto}» y no lo encuentro. "
+                     if texto else "La persona ha elegido «Otro lugar» pero no lo ha escrito. ")
+                    + "Pregúntale por un barrio o un lugar conocido y vuelve a llamar a "
+                      f"{herramienta} con su respuesta en «{parametro}».",
+        }}
+    opciones = _analizar_lugar(lugar, eventos).get("opciones", [])
+    try:
+        sitio = opciones[int(datos.zona) - 1][1]
+    except (ValueError, IndexError):
+        raise ToolError("La respuesta del formulario no corresponde a ninguna opción.") from None
+    return {"ref": _resolver_lugar(sitio, eventos) if isinstance(sitio, str) else dict(sitio)}
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +738,21 @@ SoloGratis = Annotated[bool, Field(
                 "(se excluyen las que no indican precio)."
 )]
 MaxResultados = Annotated[int, Field(ge=1, le=25, description="Número máximo de eventos a devolver (1-25).")]
+DESCRIPCION_SITIO = ('Barrio, lugar conocido{bizi} o coordenadas ("41.65,-0.88"). Si la persona '
+                     'no dice dónde está (p. ej. "cerca de mí"), déjalo vacío: se le preguntará.')
+
+
+# Resolvers: se ejecutan antes que la herramienta y deciden si hay que preguntar.
+# Reciben los argumentos de la herramienta por su nombre.
+def _ubicacion_eventos(lugar: str, cuando: str, ctx: Context):
+    desde, hasta = _resolver_fechas(cuando)
+    return _preguntar_si_hace_falta(lugar, fetch_eventos(desde, hasta), ctx,
+                                    "eventos_cerca_de", "lugar")
+
+
+def _ubicacion_bizi(zona: str, ctx: Context):
+    return _preguntar_si_hace_falta(zona, fetch_eventos(date.today()), ctx,
+                                    "estado_bizi", "zona")
 
 
 @mcp.tool()
@@ -584,9 +782,8 @@ def buscar_eventos(
 
 @mcp.tool()
 def eventos_cerca_de(
-    lugar: Annotated[str, Field(
-        description='Barrio, lugar conocido o coordenadas ("41.65,-0.88").'
-    )],
+    ubicacion: Annotated[ElicitationResult[Any], Resolve(_ubicacion_eventos)],
+    lugar: Annotated[str, Field(description=DESCRIPCION_SITIO.format(bizi=""))] = "",
     cuando: Cuando = "hoy",
     radio_km: Annotated[float, Field(
         ge=0.1, le=10,
@@ -605,8 +802,8 @@ def eventos_cerca_de(
     Reconoce barrios (Delicias, Actur, Casco Histórico...), lugares de la agenda
     (centros cívicos, teatros, museos), nombres de estaciones Bizi y coordenadas
     "lat,lon". No entiende direcciones postales cualesquiera. La respuesta indica
-    qué punto de referencia se ha usado: si no es el que la persona quería, pídele
-    un sitio más concreto.
+    qué punto de referencia se ha usado. Si el sitio es ambiguo o no se conoce,
+    la herramienta pregunta a la persona desde dónde parte.
 
     Si el lugar es un barrio, devuelve los eventos de ese barrio. Si es un sitio
     concreto, devuelve los que están dentro del radio, con la distancia en metros
@@ -619,7 +816,13 @@ def eventos_cerca_de(
     """
     desde, hasta = _resolver_fechas(cuando)
     eventos = fetch_eventos(desde, hasta)
-    ref = _resolver_lugar(lugar, eventos)
+    elegida = _ubicacion_elegida(
+        ubicacion, lugar, eventos, "eventos_cerca_de", "lugar",
+        "La persona no ha indicado desde dónde parte. No insistas: ofrécele buscar "
+        "planes sin ubicación con buscar_eventos.")
+    if "respuesta" in elegida:
+        return elegida["respuesta"]
+    ref = elegida["ref"]
     punto = (ref["lat"], ref["lon"])
     barrio = ref.get("barrio")
 
@@ -690,9 +893,8 @@ def _minutos_desde(marca) -> int | None:
 
 @mcp.tool()
 def estado_bizi(
-    zona: Annotated[str, Field(
-        description='Barrio, lugar conocido, estación Bizi o coordenadas ("41.65,-0.88").'
-    )],
+    ubicacion: Annotated[ElicitationResult[Any], Resolve(_ubicacion_bizi)],
+    zona: Annotated[str, Field(description=DESCRIPCION_SITIO.format(bizi=", estación Bizi"))] = "",
     para: Annotated[Literal["coger", "dejar", "cualquiera"], Field(
         description='"coger" (solo estaciones con bicis), "dejar" (solo con anclajes '
                     'libres) o "cualquiera".'
@@ -710,14 +912,21 @@ def estado_bizi(
 
     Reconoce los mismos sitios que eventos_cerca_de: barrios, lugares de la agenda,
     estaciones Bizi y coordenadas "lat,lon". Para un barrio se toma como referencia
-    su centro. La respuesta indica qué punto se ha usado.
+    su centro. La respuesta indica qué punto se ha usado. Si el sitio es ambiguo o
+    no se conoce, la herramienta pregunta a la persona desde dónde parte.
 
     Devuelve las estaciones ordenadas por cercanía, con la distancia en metros en
     línea recta, y deja fuera las que están fuera de servicio. Los datos son del
     momento de la consulta: dilo así ("ahora mismo hay..."), porque pueden cambiar
     antes de que la persona llegue.
     """
-    ref = _resolver_lugar(zona, fetch_eventos(date.today()))
+    elegida = _ubicacion_elegida(
+        ubicacion, zona, fetch_eventos(date.today()), "estado_bizi", "zona",
+        "La persona no ha indicado desde dónde parte. No insistas: dile que puede "
+        "pedirte las estaciones de una zona concreta cuando quiera.")
+    if "respuesta" in elegida:
+        return elegida["respuesta"]
+    ref = elegida["ref"]
     punto = (ref["lat"], ref["lon"])
     estados = _estado_estaciones()
 

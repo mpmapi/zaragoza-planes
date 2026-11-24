@@ -59,6 +59,7 @@ Reinicia Claude Desktop y pregúntale: *"¿Qué exposiciones gratis hay este fin
 - **Datos limpios para el agente:** la API devuelve muchos campos; el servidor los reduce a lo que importa en una conversación (qué, dónde, cuándo, cuánto cuesta).
 - **Fechas en lenguaje natural:** acepta "hoy", "mañana", "finde" o "jueves", como hablaría una persona.
 - **Sin servicios externos para ubicar sitios:** "cerca de Plaza España" se resuelve con los propios datos abiertos (barrios, lugares de la agenda y estaciones Bizi). Lo que escribe la persona no sale hacia terceros.
+- **Pregunta en vez de adivinar:** si en `eventos_cerca_de` o `estado_bizi` la ubicación está vacía ("cerca de mí"), no se conoce o es ambigua, el servidor pregunta a la persona desde dónde parte con un formulario de opciones (*elicitation* de MCP). Si el cliente no admite formularios, la herramienta no falla: devuelve la pregunta y las opciones para que la haga el agente.
 - **Errores que el agente entiende:** los fallos previstos (fecha no válida, sitio desconocido, API caída) se devuelven con un mensaje que explica qué probar.
 
 ## Fuente de datos
